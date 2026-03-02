@@ -310,6 +310,9 @@ pub struct AppState {
     /// Nextcloud Talk webhook secret for signature verification
     pub nextcloud_talk_webhook_secret: Option<Arc<str>>,
     pub wati: Option<Arc<WatiChannel>>,
+    pub line: Option<Arc<crate::channels::LineChannel>>,
+    /// LINE channel secret for webhook signature verification (`X-Line-Signature`)
+    pub line_channel_secret: Option<Arc<str>>,
     pub qq: Option<Arc<QQChannel>>,
     pub qq_webhook_enabled: bool,
     /// Observability backend for metrics scraping
@@ -478,6 +481,27 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
         })
         .map(Arc::from);
 
+    // LINE channel (if configured)
+    let line_channel: Option<Arc<crate::channels::LineChannel>> =
+        config.channels_config.line.as_ref().map(|lc| {
+            Arc::new(crate::channels::LineChannel::new(
+                lc.channel_access_token.clone(),
+                lc.channel_secret.clone(),
+                lc.allowed_users.clone(),
+                lc.allowed_groups.clone(),
+                lc.dm_policy,
+                lc.group_policy,
+                lc.mention_only,
+                lc.media_max_bytes,
+                lc.groups.clone(),
+            ))
+        });
+    let line_channel_secret: Option<Arc<str>> = config
+        .channels_config
+        .line
+        .as_ref()
+        .map(|lc| Arc::from(lc.channel_secret.as_str()));
+
     // Linq channel (if configured)
     let linq_channel: Option<Arc<LinqChannel>> = config.channels_config.linq.as_ref().map(|lq| {
         Arc::new(LinqChannel::new(
@@ -619,6 +643,9 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
         println!("  GET  /whatsapp  — Meta webhook verification");
         println!("  POST /whatsapp  — WhatsApp message webhook");
     }
+    if line_channel.is_some() {
+        println!("  POST /line/webhook — LINE message webhook");
+    }
     if linq_channel.is_some() {
         println!("  POST /linq      — Linq message webhook (iMessage/RCS/SMS)");
     }
@@ -691,6 +718,8 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
         nextcloud_talk: nextcloud_talk_channel,
         nextcloud_talk_webhook_secret,
         wati: wati_channel,
+        line: line_channel,
+        line_channel_secret,
         qq: qq_channel,
         qq_webhook_enabled,
         observer: broadcast_observer,
@@ -733,6 +762,7 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
         .route("/webhook", get(handle_webhook_usage).post(handle_webhook))
         .route("/whatsapp", get(handle_whatsapp_verify))
         .route("/whatsapp", post(handle_whatsapp_message))
+        .route("/line/webhook", post(handle_line_webhook))
         .route("/linq", post(handle_linq_webhook))
         .route("/wati", get(handle_wati_verify))
         .route("/wati", post(handle_wati_webhook))
@@ -1840,6 +1870,106 @@ async fn handle_whatsapp_message(
     (StatusCode::OK, Json(serde_json::json!({"status": "ok"})))
 }
 
+/// POST /line — incoming LINE message webhook
+async fn handle_line_webhook(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> impl IntoResponse {
+    let Some(ref line) = state.line else {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({"error": "LINE not configured"})),
+        );
+    };
+
+    // ── Security: Verify X-Line-Signature (HMAC-SHA256, base64) ──
+    if let Some(ref channel_secret) = state.line_channel_secret {
+        let signature = headers
+            .get("X-Line-Signature")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("");
+
+        if !crate::channels::LineChannel::verify_signature(channel_secret, &body, signature) {
+            tracing::warn!(
+                "LINE webhook signature verification failed (signature: {})",
+                if signature.is_empty() {
+                    "missing"
+                } else {
+                    "invalid"
+                }
+            );
+            return (
+                StatusCode::UNAUTHORIZED,
+                Json(serde_json::json!({"error": "Invalid signature"})),
+            );
+        }
+    }
+
+    // Parse JSON body
+    let Ok(payload) = serde_json::from_slice::<serde_json::Value>(&body) else {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": "Invalid JSON payload"})),
+        );
+    };
+
+    // Parse messages from the webhook payload
+    let messages = line.parse_webhook_payload(&payload);
+
+    if messages.is_empty() {
+        return (StatusCode::OK, Json(serde_json::json!({"status": "ok"})));
+    }
+
+    // Spawn processing in background so we return 200 OK immediately.
+    // LINE requires a fast webhook response; the 30s gateway timeout would
+    // otherwise kill the handler before the LLM finishes.
+    for msg in messages {
+        tracing::info!(
+            "LINE message from {}: {}",
+            msg.sender,
+            truncate_with_ellipsis(&msg.content, 50)
+        );
+
+        let state = state.clone();
+        let line = Arc::clone(line);
+        tokio::spawn(async move {
+            // Auto-save to memory
+            if state.auto_save {
+                let key = format!("line:msg:{}", msg.id);
+                let _ = state
+                    .mem
+                    .store(&key, &msg.content, MemoryCategory::Conversation, None)
+                    .await;
+            }
+
+            match run_gateway_chat_with_tools(&state, &msg.content).await {
+                Ok(response) => {
+                    let safe_response =
+                        sanitize_gateway_response(&response, state.tools_registry_exec.as_ref());
+                    if let Err(e) = line
+                        .send(&SendMessage::new(safe_response, &msg.reply_target))
+                        .await
+                    {
+                        tracing::error!("Failed to send LINE reply: {e}");
+                    }
+                }
+                Err(e) => {
+                    tracing::error!("LLM error for LINE message: {e:#}");
+                    let _ = line
+                        .send(&SendMessage::new(
+                            "Sorry, I couldn't process your message right now.",
+                            &msg.reply_target,
+                        ))
+                        .await;
+                }
+            }
+        });
+    }
+
+    (StatusCode::OK, Json(serde_json::json!({"status": "ok"})))
+}
+
 /// POST /linq — incoming message webhook (iMessage/RCS/SMS via Linq)
 async fn handle_linq_webhook(
     State(state): State<AppState>,
@@ -2363,6 +2493,8 @@ mod tests {
             nextcloud_talk: None,
             nextcloud_talk_webhook_secret: None,
             wati: None,
+            line: None,
+            line_channel_secret: None,
             qq: None,
             qq_webhook_enabled: false,
             observer: Arc::new(crate::observability::NoopObserver),
@@ -2419,6 +2551,8 @@ mod tests {
             nextcloud_talk: None,
             nextcloud_talk_webhook_secret: None,
             wati: None,
+            line: None,
+            line_channel_secret: None,
             qq: None,
             qq_webhook_enabled: false,
             observer,
@@ -2461,6 +2595,8 @@ mod tests {
             nextcloud_talk: None,
             nextcloud_talk_webhook_secret: None,
             wati: None,
+            line: None,
+            line_channel_secret: None,
             qq: None,
             qq_webhook_enabled: false,
             observer: Arc::new(crate::observability::NoopObserver),
@@ -2504,6 +2640,8 @@ mod tests {
             nextcloud_talk: None,
             nextcloud_talk_webhook_secret: None,
             wati: None,
+            line: None,
+            line_channel_secret: None,
             qq: None,
             qq_webhook_enabled: false,
             observer: Arc::new(crate::observability::NoopObserver),
@@ -2973,6 +3111,8 @@ Reminder set successfully."#;
             nextcloud_talk: None,
             nextcloud_talk_webhook_secret: None,
             wati: None,
+            line: None,
+            line_channel_secret: None,
             qq: None,
             qq_webhook_enabled: false,
             observer: Arc::new(crate::observability::NoopObserver),
@@ -3042,6 +3182,8 @@ Reminder set successfully."#;
             nextcloud_talk: None,
             nextcloud_talk_webhook_secret: None,
             wati: None,
+            line: None,
+            line_channel_secret: None,
             qq: None,
             qq_webhook_enabled: false,
             observer: Arc::new(crate::observability::NoopObserver),
@@ -3093,6 +3235,8 @@ Reminder set successfully."#;
             nextcloud_talk: None,
             nextcloud_talk_webhook_secret: None,
             wati: None,
+            line: None,
+            line_channel_secret: None,
             qq: None,
             qq_webhook_enabled: false,
             observer: Arc::new(crate::observability::NoopObserver),
@@ -3145,6 +3289,8 @@ Reminder set successfully."#;
             nextcloud_talk: None,
             nextcloud_talk_webhook_secret: None,
             wati: None,
+            line: None,
+            line_channel_secret: None,
             qq: None,
             qq_webhook_enabled: false,
             observer: Arc::new(crate::observability::NoopObserver),
@@ -3206,6 +3352,8 @@ Reminder set successfully."#;
             nextcloud_talk: None,
             nextcloud_talk_webhook_secret: None,
             wati: None,
+            line: None,
+            line_channel_secret: None,
             qq: None,
             qq_webhook_enabled: false,
             observer: Arc::new(crate::observability::NoopObserver),
@@ -3260,6 +3408,8 @@ Reminder set successfully."#;
             nextcloud_talk: None,
             nextcloud_talk_webhook_secret: None,
             wati: None,
+            line: None,
+            line_channel_secret: None,
             qq: None,
             qq_webhook_enabled: false,
             observer: Arc::new(crate::observability::NoopObserver),
@@ -3319,6 +3469,8 @@ Reminder set successfully."#;
             nextcloud_talk: None,
             nextcloud_talk_webhook_secret: None,
             wati: None,
+            line: None,
+            line_channel_secret: None,
             qq: None,
             qq_webhook_enabled: false,
             observer: Arc::new(crate::observability::NoopObserver),
@@ -3402,6 +3554,8 @@ Reminder set successfully."#;
             nextcloud_talk: None,
             nextcloud_talk_webhook_secret: None,
             wati: None,
+            line: None,
+            line_channel_secret: None,
             qq: None,
             qq_webhook_enabled: false,
             observer: Arc::new(crate::observability::NoopObserver),
@@ -3456,6 +3610,8 @@ Reminder set successfully."#;
             nextcloud_talk: None,
             nextcloud_talk_webhook_secret: None,
             wati: None,
+            line: None,
+            line_channel_secret: None,
             qq: None,
             qq_webhook_enabled: false,
             observer: Arc::new(crate::observability::NoopObserver),
@@ -3515,6 +3671,8 @@ Reminder set successfully."#;
             nextcloud_talk: None,
             nextcloud_talk_webhook_secret: None,
             wati: None,
+            line: None,
+            line_channel_secret: None,
             qq: None,
             qq_webhook_enabled: false,
             observer: Arc::new(crate::observability::NoopObserver),
@@ -3579,6 +3737,8 @@ Reminder set successfully."#;
             nextcloud_talk: None,
             nextcloud_talk_webhook_secret: None,
             wati: None,
+            line: None,
+            line_channel_secret: None,
             qq: None,
             qq_webhook_enabled: false,
             observer: Arc::new(crate::observability::NoopObserver),
@@ -3638,6 +3798,8 @@ Reminder set successfully."#;
             nextcloud_talk: Some(channel),
             nextcloud_talk_webhook_secret: Some(Arc::from(secret)),
             wati: None,
+            line: None,
+            line_channel_secret: None,
             qq: None,
             qq_webhook_enabled: false,
             observer: Arc::new(crate::observability::NoopObserver),
@@ -3690,6 +3852,8 @@ Reminder set successfully."#;
             nextcloud_talk: None,
             nextcloud_talk_webhook_secret: None,
             wati: None,
+            line: None,
+            line_channel_secret: None,
             qq: None,
             qq_webhook_enabled: false,
             observer: Arc::new(crate::observability::NoopObserver),

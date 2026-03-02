@@ -3842,6 +3842,8 @@ pub struct ChannelsConfig {
     /// QQ Official Bot channel configuration.
     pub qq: Option<QQConfig>,
     pub nostr: Option<NostrConfig>,
+    /// LINE Messaging API channel configuration.
+    pub line: Option<LineConfig>,
     /// ClawdTalk voice channel configuration.
     pub clawdtalk: Option<crate::channels::clawdtalk::ClawdTalkConfig>,
     /// Base timeout in seconds for processing a single channel message (LLM + tools).
@@ -3936,6 +3938,10 @@ impl ChannelsConfig {
                 Box::new(ConfigWrapper::new(self.clawdtalk.as_ref())),
                 self.clawdtalk.is_some(),
             ),
+            (
+                Box::new(ConfigWrapper::new(self.line.as_ref())),
+                self.line.is_some(),
+            ),
         ]
     }
 
@@ -3976,6 +3982,7 @@ impl Default for ChannelsConfig {
             dingtalk: None,
             qq: None,
             nostr: None,
+            line: None,
             clawdtalk: None,
             message_timeout_secs: default_channel_message_timeout_secs(),
         }
@@ -4388,6 +4395,97 @@ impl ChannelConfig for WhatsAppConfig {
     }
     fn desc() -> &'static str {
         "Business Cloud API"
+    }
+}
+
+/// LINE Messaging API DM access policy.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default, JsonSchema)]
+#[serde(rename_all = "lowercase")]
+pub enum LineDmPolicy {
+    /// Allow all DMs (default).
+    #[default]
+    Open,
+    /// Only allow DMs from users in `allowed_users`.
+    Allowlist,
+    /// Disable DM handling entirely.
+    Disabled,
+}
+
+/// LINE Messaging API group access policy.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default, JsonSchema)]
+#[serde(rename_all = "lowercase")]
+pub enum LineGroupPolicy {
+    /// Allow all groups (default).
+    #[default]
+    Open,
+    /// Only allow groups in `allowed_groups`.
+    Allowlist,
+    /// Disable group handling entirely.
+    Disabled,
+}
+
+/// Per-group configuration overrides for LINE.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct LineGroupOverride {
+    /// Whether this group is enabled.
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    /// Allowed user IDs within this group (empty = all allowed).
+    #[serde(default)]
+    pub allowed_users: Vec<String>,
+    /// Whether the bot must be @mentioned to respond in this group.
+    #[serde(default)]
+    pub require_mention: bool,
+}
+
+fn default_line_dm_policy() -> LineDmPolicy {
+    LineDmPolicy::Open
+}
+
+fn default_line_group_policy() -> LineGroupPolicy {
+    LineGroupPolicy::Open
+}
+
+fn default_line_media_max_bytes() -> usize {
+    10 * 1024 * 1024 // 10 MB
+}
+
+/// LINE Messaging API channel configuration.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct LineConfig {
+    /// LINE Messaging API channel access token.
+    pub channel_access_token: String,
+    /// LINE channel secret (for HMAC-SHA256 webhook signature verification).
+    pub channel_secret: String,
+    /// Allowed user IDs or `"*"` for all.
+    #[serde(default)]
+    pub allowed_users: Vec<String>,
+    /// Allowed group IDs or `"*"` for all.
+    #[serde(default)]
+    pub allowed_groups: Vec<String>,
+    /// DM access policy (default: open).
+    #[serde(default = "default_line_dm_policy")]
+    pub dm_policy: LineDmPolicy,
+    /// Group access policy (default: open).
+    #[serde(default = "default_line_group_policy")]
+    pub group_policy: LineGroupPolicy,
+    /// Whether bot must be @mentioned in groups to respond.
+    #[serde(default)]
+    pub mention_only: bool,
+    /// Max media download size in bytes (default: 10 MB).
+    #[serde(default = "default_line_media_max_bytes")]
+    pub media_max_bytes: usize,
+    /// Per-group configuration overrides keyed by group ID.
+    #[serde(default)]
+    pub groups: std::collections::HashMap<String, LineGroupOverride>,
+}
+
+impl ChannelConfig for LineConfig {
+    fn name() -> &'static str {
+        "LINE"
+    }
+    fn desc() -> &'static str {
+        "Messaging API"
     }
 }
 

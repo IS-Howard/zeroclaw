@@ -23,6 +23,12 @@ pub mod imessage;
 pub mod irc;
 #[cfg(feature = "channel-lark")]
 pub mod lark;
+pub mod line;
+pub mod line_flex;
+pub mod line_markdown;
+pub mod line_media;
+pub mod line_rich_menu;
+pub mod line_templates;
 pub mod linq;
 #[cfg(feature = "channel-matrix")]
 pub mod matrix;
@@ -51,6 +57,7 @@ pub use imessage::IMessageChannel;
 pub use irc::IrcChannel;
 #[cfg(feature = "channel-lark")]
 pub use lark::LarkChannel;
+pub use line::LineChannel;
 pub use linq::LinqChannel;
 #[cfg(feature = "channel-matrix")]
 pub use matrix::MatrixChannel;
@@ -482,6 +489,17 @@ fn channel_delivery_instructions(channel_name: &str) -> Option<&'static str> {
              - Keep normal text outside markers and never wrap markers in code fences.\n\
              - You can combine text and media in one response — text is sent first, then each attachment.\n\
              - Use tool results silently: answer the latest user message directly, and do not narrate delayed/internal tool execution bookkeeping.",
+        ),
+        "line" => Some(
+            "When responding on LINE:\n\
+             - Keep text under 5000 chars per message.\n\
+             - Use plain text; markdown is auto-converted to Flex Messages (tables become visual cards, code blocks become styled bubbles).\n\
+             - Use [[quick_replies: Option 1, Option 2]] to show quick reply buttons.\n\
+             - Use [[location: Title | Address | lat | lng]] to send a location pin.\n\
+             - Use [[confirm: Question? | Yes | No]] for a yes/no dialog.\n\
+             - Use [[buttons: Title | Text | Btn1:action1, Btn2:action2]] for button menus.\n\
+             - Be concise and direct.\n\
+             - Use tool results silently: answer the latest user message directly.",
         ),
         _ => None,
     }
@@ -4532,6 +4550,23 @@ fn collect_configured_channels(
                 tracing::warn!("WhatsApp config invalid: neither phone_number_id (Cloud API) nor session_path (Web) is set");
             }
         }
+    }
+
+    if let Some(ref line_cfg) = config.channels_config.line {
+        channels.push(ConfiguredChannel {
+            display_name: "LINE",
+            channel: Arc::new(LineChannel::new(
+                line_cfg.channel_access_token.clone(),
+                line_cfg.channel_secret.clone(),
+                line_cfg.allowed_users.clone(),
+                line_cfg.allowed_groups.clone(),
+                line_cfg.dm_policy,
+                line_cfg.group_policy,
+                line_cfg.mention_only,
+                line_cfg.media_max_bytes,
+                line_cfg.groups.clone(),
+            )),
+        });
     }
 
     if let Some(ref lq) = config.channels_config.linq {
