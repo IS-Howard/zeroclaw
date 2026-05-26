@@ -47,6 +47,8 @@ pub struct LineChannel {
     media_max_bytes: usize,
     groups: HashMap<String, LineGroupOverride>,
     profile_cache: Arc<Mutex<HashMap<String, (LineUserProfile, Instant)>>>,
+    /// Reply tokens keyed by reply_target. One-time use, expire after ~1 minute.
+    reply_tokens: Arc<Mutex<HashMap<String, String>>>,
     http: reqwest::Client,
 }
 
@@ -73,6 +75,7 @@ impl LineChannel {
             media_max_bytes,
             groups,
             profile_cache: Arc::new(Mutex::new(HashMap::new())),
+            reply_tokens: Arc::new(Mutex::new(HashMap::new())),
             http: crate::config::build_runtime_proxy_client("channel.line"),
         }
     }
@@ -120,6 +123,7 @@ impl LineChannel {
     /// Parse an incoming LINE webhook payload and extract messages.
     ///
     /// Applies access control (dm_policy, group_policy, allowlists).
+    /// Reply tokens are captured and stored for use by `send_with_reply_token()`.
     pub fn parse_webhook_payload(&self, payload: &Value) -> Vec<ChannelMessage> {
         let mut messages = Vec::new();
 
@@ -132,6 +136,32 @@ impl LineChannel {
                 .get("type")
                 .and_then(|t| t.as_str())
                 .unwrap_or("");
+
+            // Capture reply token (one-time use, expires ~1 min)
+            if let Some(reply_token) = event.get("replyToken").and_then(|t| t.as_str()) {
+                if !reply_token.is_empty() {
+                    // Store keyed by reply_target (determined below)
+                    // We'll update the key once we know the target
+                    let source = event.get("source");
+                    let src_user = source
+                        .and_then(|s| s.get("userId"))
+                        .and_then(|u| u.as_str())
+                        .unwrap_or("");
+                    let src_group = source
+                        .and_then(|s| s.get("groupId"))
+                        .and_then(|g| g.as_str());
+                    let src_room = source
+                        .and_then(|s| s.get("roomId"))
+                        .and_then(|r| r.as_str());
+                    let target = src_group
+                        .or(src_room)
+                        .unwrap_or(src_user);
+                    if !target.is_empty() {
+                        let mut tokens = self.reply_tokens.lock();
+                        tokens.insert(target.to_string(), reply_token.to_string());
+                    }
+                }
+            }
 
             let timestamp = event
                 .get("timestamp")
@@ -361,6 +391,26 @@ impl LineChannel {
 
     // ─── Outbound Sending ──────────────────────────────────────────────
 
+    /// Take (consume) a stored reply token for a target, if available.
+    pub fn take_reply_token(&self, target: &str) -> Option<String> {
+        let mut tokens = self.reply_tokens.lock();
+        tokens.remove(target)
+    }
+
+    /// Process and send an outbound message, trying reply API first if a token is available.
+    ///
+    /// The reply API is free (no message quota), so we prefer it when possible.
+    /// Reply tokens are one-time use and expire after ~1 minute. If the reply
+    /// fails (expired/already used), we fall back to push.
+    pub async fn send_with_reply_token(
+        &self,
+        recipient: &str,
+        content: &str,
+        reply_token: Option<String>,
+    ) -> anyhow::Result<()> {
+        self.send_message_inner(recipient, content, reply_token).await
+    }
+
     /// Process and send an outbound message through the LINE API.
     ///
     /// Pipeline:
@@ -368,6 +418,18 @@ impl LineChannel {
     /// 2. Parse special markers ([[quick_replies:...]], [[location:...]], etc.)
     /// 3. Batch messages (max 5 per push request)
     async fn send_message(&self, recipient: &str, content: &str) -> anyhow::Result<()> {
+        // Check for a stored reply token for this recipient
+        let reply_token = self.take_reply_token(&normalize_target(recipient));
+        self.send_message_inner(recipient, content, reply_token).await
+    }
+
+    /// Inner send implementation with optional reply token.
+    async fn send_message_inner(
+        &self,
+        recipient: &str,
+        content: &str,
+        reply_token: Option<String>,
+    ) -> anyhow::Result<()> {
         // Normalize recipient (strip line: prefixes)
         let to = normalize_target(recipient);
 
@@ -385,6 +447,9 @@ impl LineChannel {
         let (text, quick_replies, location, templates) =
             parse_special_markers(&processed.text);
 
+        // 3b. Extract image and sticker markers from text
+        let (text, media_messages) = extract_media_markers(&text);
+
         // 4. Add template messages
         for tmpl in templates {
             all_messages.push(tmpl);
@@ -393,6 +458,11 @@ impl LineChannel {
         // 5. Add location message
         if let Some(loc) = location {
             all_messages.push(loc);
+        }
+
+        // 5b. Add media messages (images, stickers)
+        for media in media_messages {
+            all_messages.push(media);
         }
 
         // 6. Chunk text and add text messages
@@ -428,9 +498,37 @@ impl LineChannel {
             return Ok(());
         }
 
-        // 7. Send in batches of MAX_MESSAGES_PER_BATCH
-        for batch in all_messages.chunks(MAX_MESSAGES_PER_BATCH) {
+        // 7. Send in batches of MAX_MESSAGES_PER_BATCH.
+        //    Use reply token for the first batch (free, no quota), then push for the rest.
+        let mut batches = all_messages.chunks(MAX_MESSAGES_PER_BATCH);
+        let mut used_reply = false;
+
+        if let Some(first_batch) = batches.next() {
+            if let Some(ref token) = reply_token {
+                match self.reply_messages(token, first_batch).await {
+                    Ok(()) => {
+                        used_reply = true;
+                        tracing::debug!("LINE: sent first batch via reply API");
+                    }
+                    Err(e) => {
+                        tracing::debug!(
+                            "LINE: reply API failed ({e:#}), falling back to push"
+                        );
+                        self.push_messages(&to, first_batch).await?;
+                    }
+                }
+            } else {
+                self.push_messages(&to, first_batch).await?;
+            }
+        }
+
+        // Remaining batches always use push
+        for batch in batches {
             self.push_messages(&to, batch).await?;
+        }
+
+        if used_reply {
+            tracing::debug!("LINE: used reply token (free, no quota cost)");
         }
 
         Ok(())
@@ -494,6 +592,101 @@ impl LineChannel {
         }
 
         Ok(())
+    }
+
+    /// Send messages to multiple users at once (max 500 per request).
+    pub async fn multicast(
+        &self,
+        user_ids: &[String],
+        messages: &[Value],
+    ) -> anyhow::Result<()> {
+        let url = format!("{LINE_API_BASE}/v2/bot/message/multicast");
+
+        for batch in user_ids.chunks(500) {
+            let body = json!({
+                "to": batch,
+                "messages": messages,
+            });
+
+            let resp = self
+                .http
+                .post(&url)
+                .bearer_auth(&self.channel_access_token)
+                .json(&body)
+                .send()
+                .await
+                .context("LINE multicast request failed")?;
+
+            if !resp.status().is_success() {
+                let status = resp.status();
+                let error_body = resp.text().await.unwrap_or_default();
+                let sanitized = crate::providers::sanitize_api_error(&error_body);
+                tracing::error!("LINE multicast failed: {status} — {sanitized}");
+                bail!("LINE multicast API error: {status}");
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Broadcast a message to all followers.
+    pub async fn broadcast(&self, messages: &[Value]) -> anyhow::Result<()> {
+        let url = format!("{LINE_API_BASE}/v2/bot/message/broadcast");
+        let body = json!({ "messages": messages });
+
+        let resp = self
+            .http
+            .post(&url)
+            .bearer_auth(&self.channel_access_token)
+            .json(&body)
+            .send()
+            .await
+            .context("LINE broadcast request failed")?;
+
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let error_body = resp.text().await.unwrap_or_default();
+            let sanitized = crate::providers::sanitize_api_error(&error_body);
+            tracing::error!("LINE broadcast failed: {status} — {sanitized}");
+            bail!("LINE broadcast API error: {status}");
+        }
+
+        Ok(())
+    }
+
+    /// Get the number of messages sent this month (quota usage).
+    /// Returns `(quota_limit, total_used)`.
+    pub async fn get_message_quota(&self) -> anyhow::Result<(u64, u64)> {
+        let mut quota: u64 = 0;
+        let mut used: u64 = 0;
+
+        let quota_url = format!("{LINE_API_BASE}/v2/bot/message/quota");
+        if let Ok(resp) = self
+            .http
+            .get(&quota_url)
+            .bearer_auth(&self.channel_access_token)
+            .send()
+            .await
+        {
+            if let Ok(v) = resp.json::<Value>().await {
+                quota = v["value"].as_u64().unwrap_or(0);
+            }
+        }
+
+        let consumption_url = format!("{LINE_API_BASE}/v2/bot/message/quota/consumption");
+        if let Ok(resp) = self
+            .http
+            .get(&consumption_url)
+            .bearer_auth(&self.channel_access_token)
+            .send()
+            .await
+        {
+            if let Ok(v) = resp.json::<Value>().await {
+                used = v["totalUsage"].as_u64().unwrap_or(0);
+            }
+        }
+
+        Ok((quota, used))
     }
 
     // ─── Profile Cache ─────────────────────────────────────────────────
@@ -560,6 +753,72 @@ impl LineChannel {
             .await;
 
         Ok(())
+    }
+
+    // ─── Media Download ─────────────────────────────────────────────
+
+    /// Resolve media placeholders in a message content string.
+    ///
+    /// Replaces `[IMAGE:line-media:MSG_ID]`, `[VIDEO:line-media:MSG_ID]`,
+    /// `[AUDIO:line-media:MSG_ID]`, and `[DOCUMENT:name:line-media:MSG_ID]`
+    /// with actual downloaded file paths.
+    pub async fn resolve_media_in_content(&self, content: &str) -> String {
+        use super::line_media;
+
+        let re = match regex::Regex::new(
+            r"\[(IMAGE|VIDEO|AUDIO|DOCUMENT)(?::([^:]*?))?:line-media:([^\]]+)\]",
+        ) {
+            Ok(r) => r,
+            Err(_) => return content.to_string(),
+        };
+
+        let mut result = content.to_string();
+
+        // Collect all matches first (to avoid borrow issues during async replacement)
+        let captures: Vec<(String, String, String, String)> = re
+            .captures_iter(content)
+            .map(|cap| {
+                (
+                    cap[0].to_string(),                                    // full match
+                    cap[1].to_string(),                                    // type
+                    cap.get(2).map_or("".to_string(), |m| m.as_str().to_string()), // optional name
+                    cap[3].to_string(),                                    // message_id
+                )
+            })
+            .collect();
+
+        for (full_match, media_type, _name, message_id) in captures {
+            match line_media::download_line_media(
+                &self.http,
+                &self.channel_access_token,
+                &message_id,
+                self.media_max_bytes,
+            )
+            .await
+            {
+                Ok(download) => {
+                    let path = download.path.display();
+                    let replacement = format!(
+                        "[{media_type}:{path} ({}, {} bytes)]",
+                        download.content_type, download.size
+                    );
+                    result = result.replace(&full_match, &replacement);
+                    tracing::debug!(
+                        "LINE: downloaded {media_type} {message_id} → {path} ({})",
+                        download.content_type
+                    );
+                }
+                Err(e) => {
+                    tracing::warn!("LINE: failed to download media {message_id}: {e:#}");
+                    // Keep placeholder but add error note
+                    let replacement =
+                        format!("[{media_type}:download-failed:{message_id}]");
+                    result = result.replace(&full_match, &replacement);
+                }
+            }
+        }
+
+        result
     }
 }
 
@@ -756,6 +1015,43 @@ fn parse_special_markers(text: &str) -> (String, Vec<String>, Option<Value>, Vec
     }
 
     (remaining, quick_replies, location, templates)
+}
+
+/// Extract image and sticker markers from text and convert to LINE message objects.
+///
+/// Supported markers:
+/// - `[IMAGE:https://...]` — sends an image message
+/// - `[STICKER:packageId/stickerId]` — sends a sticker message
+fn extract_media_markers(text: &str) -> (String, Vec<Value>) {
+    let mut remaining = text.to_string();
+    let mut media = Vec::new();
+
+    // Images: [IMAGE:url]
+    if let Ok(re) = regex::Regex::new(r"\[IMAGE:(https?://[^\]\s]+)\]") {
+        for cap in re.captures_iter(text) {
+            let url = &cap[1];
+            media.push(json!({
+                "type": "image",
+                "originalContentUrl": url,
+                "previewImageUrl": url,
+            }));
+        }
+        remaining = re.replace_all(&remaining, "").to_string();
+    }
+
+    // Stickers: [STICKER:packageId/stickerId]
+    if let Ok(re) = regex::Regex::new(r"\[STICKER:(\d+)/(\d+)\]") {
+        for cap in re.captures_iter(text) {
+            media.push(json!({
+                "type": "sticker",
+                "packageId": &cap[1],
+                "stickerId": &cap[2],
+            }));
+        }
+        remaining = re.replace_all(&remaining, "").to_string();
+    }
+
+    (remaining, media)
 }
 
 #[cfg(test)]
@@ -1102,5 +1398,89 @@ mod tests {
         assert!(qr.is_empty());
         assert!(loc.is_none());
         assert!(tmpl.is_empty());
+    }
+
+    // ── Reply Token ───────────────────────────────────────────────────
+
+    #[test]
+    fn parse_captures_reply_token() {
+        let ch = make_open_channel();
+        let payload = json!({
+            "events": [{
+                "type": "message",
+                "timestamp": 1700000000000u64,
+                "replyToken": "tok_abc123",
+                "source": { "type": "user", "userId": "U123" },
+                "message": { "id": "msg1", "type": "text", "text": "Hi" }
+            }]
+        });
+
+        let msgs = ch.parse_webhook_payload(&payload);
+        assert_eq!(msgs.len(), 1);
+
+        // Reply token should be stored keyed by reply_target (U123 for DM)
+        let token = ch.take_reply_token("U123");
+        assert_eq!(token, Some("tok_abc123".to_string()));
+
+        // Second take returns None (consumed)
+        assert_eq!(ch.take_reply_token("U123"), None);
+    }
+
+    #[test]
+    fn parse_captures_group_reply_token() {
+        let ch = make_open_channel();
+        let payload = json!({
+            "events": [{
+                "type": "message",
+                "timestamp": 1700000000000u64,
+                "replyToken": "tok_grp456",
+                "source": { "type": "group", "userId": "U123", "groupId": "C456" },
+                "message": { "id": "msg1", "type": "text", "text": "Hi group" }
+            }]
+        });
+
+        ch.parse_webhook_payload(&payload);
+
+        // Token should be keyed by groupId, not userId
+        assert_eq!(ch.take_reply_token("C456"), Some("tok_grp456".to_string()));
+        assert_eq!(ch.take_reply_token("U123"), None);
+    }
+
+    // ── Media Markers ─────────────────────────────────────────────────
+
+    #[test]
+    fn extract_image_marker() {
+        let (text, media) =
+            extract_media_markers("Check this [IMAGE:https://example.com/pic.jpg] out");
+        assert_eq!(media.len(), 1);
+        assert_eq!(media[0]["type"], "image");
+        assert_eq!(media[0]["originalContentUrl"], "https://example.com/pic.jpg");
+        assert!(!text.contains("[IMAGE:"));
+        assert!(text.contains("Check this"));
+    }
+
+    #[test]
+    fn extract_sticker_marker() {
+        let (text, media) = extract_media_markers("Here [STICKER:1/100] enjoy");
+        assert_eq!(media.len(), 1);
+        assert_eq!(media[0]["type"], "sticker");
+        assert_eq!(media[0]["packageId"], "1");
+        assert_eq!(media[0]["stickerId"], "100");
+        assert!(!text.contains("[STICKER:"));
+    }
+
+    #[test]
+    fn extract_multiple_media() {
+        let (_, media) = extract_media_markers(
+            "[IMAGE:https://a.com/1.jpg] [IMAGE:https://b.com/2.png] [STICKER:2/200]",
+        );
+        assert_eq!(media.len(), 3);
+    }
+
+    #[test]
+    fn no_media_markers() {
+        let (text, media) = extract_media_markers("Just plain text");
+        assert_eq!(text, "Just plain text");
+        assert!(media.is_empty());
     }
 }

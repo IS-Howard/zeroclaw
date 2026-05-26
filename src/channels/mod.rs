@@ -4553,11 +4553,15 @@ fn collect_configured_channels(
     }
 
     if let Some(ref line_cfg) = config.channels_config.line {
+        let access_token = std::env::var("ZEROCLAW_LINE_CHANNEL_ACCESS_TOKEN")
+            .unwrap_or_else(|_| line_cfg.channel_access_token.clone());
+        let channel_secret = std::env::var("ZEROCLAW_LINE_CHANNEL_SECRET")
+            .unwrap_or_else(|_| line_cfg.channel_secret.clone());
         channels.push(ConfiguredChannel {
             display_name: "LINE",
             channel: Arc::new(LineChannel::new(
-                line_cfg.channel_access_token.clone(),
-                line_cfg.channel_secret.clone(),
+                access_token,
+                channel_secret,
                 line_cfg.allowed_users.clone(),
                 line_cfg.allowed_groups.clone(),
                 line_cfg.dm_policy,

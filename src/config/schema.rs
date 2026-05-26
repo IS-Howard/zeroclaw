@@ -4454,8 +4454,10 @@ fn default_line_media_max_bytes() -> usize {
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct LineConfig {
     /// LINE Messaging API channel access token.
+    /// Can also be set via `ZEROCLAW_LINE_CHANNEL_ACCESS_TOKEN` environment variable.
     pub channel_access_token: String,
     /// LINE channel secret (for HMAC-SHA256 webhook signature verification).
+    /// Can also be set via `ZEROCLAW_LINE_CHANNEL_SECRET` environment variable.
     pub channel_secret: String,
     /// Allowed user IDs or `"*"` for all.
     #[serde(default)]

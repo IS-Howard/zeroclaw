@@ -482,11 +482,16 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
         .map(Arc::from);
 
     // LINE channel (if configured)
+    // Priority: environment variable > config file
     let line_channel: Option<Arc<crate::channels::LineChannel>> =
         config.channels_config.line.as_ref().map(|lc| {
+            let access_token = std::env::var("ZEROCLAW_LINE_CHANNEL_ACCESS_TOKEN")
+                .unwrap_or_else(|_| lc.channel_access_token.clone());
+            let channel_secret = std::env::var("ZEROCLAW_LINE_CHANNEL_SECRET")
+                .unwrap_or_else(|_| lc.channel_secret.clone());
             Arc::new(crate::channels::LineChannel::new(
-                lc.channel_access_token.clone(),
-                lc.channel_secret.clone(),
+                access_token,
+                channel_secret,
                 lc.allowed_users.clone(),
                 lc.allowed_groups.clone(),
                 lc.dm_policy,
@@ -496,11 +501,16 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
                 lc.groups.clone(),
             ))
         });
-    let line_channel_secret: Option<Arc<str>> = config
-        .channels_config
-        .line
-        .as_ref()
-        .map(|lc| Arc::from(lc.channel_secret.as_str()));
+    let line_channel_secret: Option<Arc<str>> = std::env::var("ZEROCLAW_LINE_CHANNEL_SECRET")
+        .ok()
+        .or_else(|| {
+            config
+                .channels_config
+                .line
+                .as_ref()
+                .map(|lc| lc.channel_secret.clone())
+        })
+        .map(|s| Arc::from(s.as_str()));
 
     // Linq channel (if configured)
     let linq_channel: Option<Arc<LinqChannel>> = config.channels_config.linq.as_ref().map(|lq| {
@@ -1931,24 +1941,42 @@ async fn handle_line_webhook(
             truncate_with_ellipsis(&msg.content, 50)
         );
 
+        // Take the reply token now (before spawning) to minimize expiration risk.
+        // Reply tokens are one-time use and expire after ~1 minute.
+        let reply_token = line.take_reply_token(&msg.reply_target);
+
         let state = state.clone();
         let line = Arc::clone(line);
         tokio::spawn(async move {
+            // Show loading animation while processing (the "..." indicator)
+            let _ = line.show_loading(&msg.reply_target).await;
+
+            // Resolve media placeholders (download images/videos/audio)
+            let content = if msg.content.contains(":line-media:") {
+                line.resolve_media_in_content(&msg.content).await
+            } else {
+                msg.content.clone()
+            };
+
             // Auto-save to memory
             if state.auto_save {
                 let key = format!("line:msg:{}", msg.id);
                 let _ = state
                     .mem
-                    .store(&key, &msg.content, MemoryCategory::Conversation, None)
+                    .store(&key, &content, MemoryCategory::Conversation, None)
                     .await;
             }
 
-            match run_gateway_chat_with_tools(&state, &msg.content).await {
+            match run_gateway_chat_with_tools(&state, &content).await {
                 Ok(response) => {
                     let safe_response =
                         sanitize_gateway_response(&response, state.tools_registry_exec.as_ref());
                     if let Err(e) = line
-                        .send(&SendMessage::new(safe_response, &msg.reply_target))
+                        .send_with_reply_token(
+                            &msg.reply_target,
+                            &safe_response,
+                            reply_token,
+                        )
                         .await
                     {
                         tracing::error!("Failed to send LINE reply: {e}");
@@ -1957,10 +1985,11 @@ async fn handle_line_webhook(
                 Err(e) => {
                     tracing::error!("LLM error for LINE message: {e:#}");
                     let _ = line
-                        .send(&SendMessage::new(
-                            "Sorry, I couldn't process your message right now.",
+                        .send_with_reply_token(
                             &msg.reply_target,
-                        ))
+                            "Sorry, I couldn't process your message right now.",
+                            None, // Don't use reply token for error msgs (likely expired)
+                        )
                         .await;
                 }
             }
